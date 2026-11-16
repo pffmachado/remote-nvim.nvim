@@ -164,6 +164,8 @@ function Provider:_setup_workspace_variables()
   end
   self._remote_os = self._host_config.os
   self._remote_arch = utils.get_release_arch_name(self._host_config.arch)
+  self._remote_is_windows = self._remote_os == "Windows"
+  self.executor.remote_is_windows = self._remote_is_windows
 
   if self._host_config.neovim_version == nil then
     local prompt_title
@@ -199,9 +201,6 @@ function Provider:_setup_workspace_variables()
     })
   end
   self._remote_neovim_home = self._host_config.remote_neovim_home
-
-  -- Set variables from the fetched configuration
-  self._remote_is_windows = self._remote_os == "Windows" and true or false
 
   -- Set up remaining workspace variables
   self._remote_workspace_id = self._host_config.workspace_id
@@ -325,16 +324,23 @@ end
 ---@return string,string remote_os_and_arch OS running on remote host
 function Provider:_get_remote_os_and_arch()
   if self._remote_os == nil then
-    self:run_command("uname -s -m", "Determining OS on remote machine")
+    -- Falls back to a marker on Windows shells (cmd/PowerShell 7) where `uname` does not exist
+    self:run_command("uname -s -m || echo Windows_NT", "Determining OS on remote machine")
     local cmd_out_lines = self.executor:job_stdout()
     local os_and_arch = vim.split(cmd_out_lines[#cmd_out_lines], " ", { trimempty = true, plain = true })
-    local os = os_and_arch[1]
+    local os = os_and_arch[1] or ""
     self._remote_arch = os_and_arch[2]
 
     if os == "Linux" then
       self._remote_os = os
     elseif os == "Darwin" then
       self._remote_os = "macOS"
+    elseif os == "Windows_NT" or os:match("^MINGW") or os:match("^MSYS") or os:match("^CYGWIN") then
+      self._remote_os = "Windows"
+      self.executor.remote_is_windows = true
+      self:run_command("Write-Output $env:PROCESSOR_ARCHITECTURE", "Determining architecture on remote machine")
+      local arch_out_lines = self.executor:job_stdout()
+      self._remote_arch = vim.trim(arch_out_lines[#arch_out_lines])
     else
       local os_choices = {
         "Linux",
@@ -363,7 +369,10 @@ end
 ---@return string home_path User's home directory path
 function Provider:_get_remote_neovim_home()
   if self._remote_neovim_home == nil then
-    self:run_command("echo $HOME", "Determining remote user's home directory")
+    self:run_command(
+      self._remote_is_windows and "Write-Output $HOME" or "echo $HOME",
+      "Determining remote user's home directory"
+    )
     local cmd_out_lines = self.executor:job_stdout()
     self._remote_neovim_home = utils.path_join(self._remote_is_windows, cmd_out_lines[#cmd_out_lines], ".remote-nvim")
   end
@@ -422,7 +431,10 @@ function Provider:_get_remote_neovim_version_preference(prompt_title)
     local version_map = {}
 
     -- Check if system-wide Neovim is available, if yes, add it as an option
-    self:run_command("nvim --version || true", "Checking if Neovim is installed system-wide on remote")
+    self:run_command(
+      self._remote_is_windows and "try { nvim --version } catch { }; exit 0" or "nvim --version || true",
+      "Checking if Neovim is installed system-wide on remote"
+    )
     local nvim_remote_check_output_lines = self.executor:job_stdout()
 
     if self.offline_mode and remote_nvim.config.offline_mode.no_github then
@@ -535,6 +547,11 @@ end
 ---Get remote neovim binary path
 ---@return string binary_path remote neovim binary path
 function Provider:_remote_neovim_binary_path()
+  if self._remote_is_windows then
+    -- System installations cannot be symlinked/copied reliably on Windows, so we use whatever is on PATH
+    return self._remote_neovim_install_method == "system" and "nvim"
+      or utils.path_join(true, self:_remote_neovim_binary_dir(), "bin", "nvim.exe")
+  end
   return utils.path_join(self._remote_is_windows, self:_remote_neovim_binary_dir(), "bin", "nvim")
 end
 
@@ -565,11 +582,19 @@ function Provider:_setup_remote()
       utils.path_join(self._remote_is_windows, self._remote_xdg_data_path, remote_nvim.config.remote.app_name),
       self:_remote_neovim_binary_dir(),
     }
-    local mkdirs_cmds = {}
-    for _, dir in ipairs(necessary_dirs) do
-      table.insert(mkdirs_cmds, ("mkdir -p %s"):format(dir))
+    local mkdirs_cmd
+    if self._remote_is_windows then
+      mkdirs_cmd = ("$ErrorActionPreference='Stop'; New-Item -ItemType Directory -Force -Path %s | Out-Null"):format(
+        table.concat(vim.tbl_map(utils.ps_quote, necessary_dirs), ",")
+      )
+    else
+      local mkdirs_cmds = {}
+      for _, dir in ipairs(necessary_dirs) do
+        table.insert(mkdirs_cmds, ("mkdir -p %s"):format(dir))
+      end
+      mkdirs_cmd = table.concat(mkdirs_cmds, " && ")
     end
-    self:run_command(table.concat(mkdirs_cmds, " && "), "Creating custom neovim directories on remote")
+    self:run_command(mkdirs_cmd, "Creating custom neovim directories on remote")
 
     -- Copy things required on remote
     self:upload(
@@ -619,6 +644,20 @@ function Provider:_setup_remote()
       self._remote_neovim_install_method,
       self._remote_arch
     )
+    if self._remote_is_windows then
+      assert(
+        not (self.offline_mode and self._remote_neovim_install_method ~= "system"),
+        "Offline mode is not supported for Windows remote hosts"
+      )
+      install_cmd = ("& %s -Version %s -Dir %s -Method %s -Arch %s"):format(
+        utils.ps_quote(utils.path_join(true, self._remote_scripts_path, "neovim_install.ps1")),
+        utils.ps_quote(self._remote_neovim_version),
+        utils.ps_quote(self._remote_neovim_home),
+        utils.ps_quote(self._remote_neovim_install_method),
+        utils.ps_quote(self._remote_arch)
+      )
+      install_cmd_lst = {}
+    end
     table.insert(install_cmd_lst, install_cmd)
 
     -- Set correct permissions and install Neovim
@@ -709,8 +748,11 @@ function Provider:_launch_remote_neovim_server()
   if not self:is_remote_server_running() then
     -- Find free port on remote
     local free_port_on_remote_cmd = ("%s -l %s"):format(
-      self:_remote_neovim_binary_path(),
-      utils.path_join(self._remote_is_windows, self._remote_scripts_path, "free_port_finder.lua")
+      self._remote_is_windows and "& " .. utils.ps_quote(self:_remote_neovim_binary_path())
+        or self:_remote_neovim_binary_path(),
+      self._remote_is_windows
+          and utils.ps_quote(utils.path_join(true, self._remote_scripts_path, "free_port_finder.lua"))
+        or utils.path_join(false, self._remote_scripts_path, "free_port_finder.lua")
     )
     self:run_command(free_port_on_remote_cmd, "Searching for free port on the remote machine")
     local remote_free_port_output = self.executor:job_stdout()
@@ -737,9 +779,25 @@ function Provider:_launch_remote_neovim_server()
       remote_free_port
     )
 
+    if self._remote_is_windows then
+      remote_server_launch_cmd = ("$env:XDG_CONFIG_HOME=%s; $env:XDG_DATA_HOME=%s; $env:XDG_STATE_HOME=%s; $env:XDG_CACHE_HOME=%s; $env:NVIM_APPNAME=%s; & %s --listen 0.0.0.0:%s --headless"):format(
+        utils.ps_quote(self._remote_xdg_config_path),
+        utils.ps_quote(self._remote_xdg_data_path),
+        utils.ps_quote(self._remote_xdg_state_path),
+        utils.ps_quote(self._remote_xdg_cache_path),
+        utils.ps_quote(remote_nvim.config.remote.app_name),
+        utils.ps_quote(self:_remote_neovim_binary_path()),
+        remote_free_port
+      )
+    end
+
     -- If we have a specified working directory, we launch there
     if self._remote_working_dir then
-      remote_server_launch_cmd = ("%s --cmd ':cd %s'"):format(remote_server_launch_cmd, self._remote_working_dir)
+      remote_server_launch_cmd = ("%s --cmd %s"):format(
+        remote_server_launch_cmd,
+        self._remote_is_windows and utils.ps_quote(":cd " .. self._remote_working_dir)
+          or ("':cd %s'"):format(self._remote_working_dir)
+      )
     end
 
     self:_run_code_in_coroutine(function()
@@ -959,14 +1017,14 @@ function Provider:_cleanup_remote_host()
 
   if cleanup_choice == deletion_choices[1] then
     self:run_command(
-      ("rm -rf %s"):format(self._remote_workspace_id_path),
+      self:_remote_rm_rf_cmd(self._remote_workspace_id_path),
       ("Deleting workspace %s from remote machine"):format(self._remote_workspace_id_path),
       nil,
       exit_cb
     )
   elseif cleanup_choice == deletion_choices[2] then
     self:run_command(
-      ("rm -rf %s"):format(self._remote_neovim_home),
+      self:_remote_rm_rf_cmd(self._remote_neovim_home),
       "Delete remote neovim created directories from remote machine",
       nil,
       exit_cb
@@ -976,6 +1034,17 @@ function Provider:_cleanup_remote_host()
 
   self._config_provider:remove_workspace_config(self.unique_host_id)
   self:hide_progress_view_window()
+end
+
+---@private
+---Build command that recursively deletes a path on the remote
+---@param path string
+---@return string
+function Provider:_remote_rm_rf_cmd(path)
+  if self._remote_is_windows then
+    return ("Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -LiteralPath %s"):format(utils.ps_quote(path))
+  end
+  return ("rm -rf %s"):format(path)
 end
 
 ---@private

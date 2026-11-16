@@ -46,13 +46,13 @@ describe("SSH Executor", function()
   describe("should run upload job with correct arguments", function()
     it("for default port SCP", function()
       executor:upload("local-path", "remote-path")
-      local scp_command = "scp -r local-path remote-host:remote-path"
+      local scp_command = "scp -q -r local-path remote-host:remote-path"
       assert.stub(executor_run_job_stub).was.called_with(executor, scp_command, { compression = {} })
     end)
 
     it("for specified port SCP", function()
       other_executor:upload("local-path", "remote-path")
-      local other_scp_command = "scp -P 2310 -r local-path remote-host:remote-path"
+      local other_scp_command = "scp -q -P 2310 -r local-path remote-host:remote-path"
       assert.stub(other_executor_run_job_stub).was.called_with(other_executor, other_scp_command, { compression = {} })
     end)
 
@@ -119,13 +119,13 @@ describe("SSH Executor", function()
   describe("should run download job with correct arguments", function()
     it("for default port SCP", function()
       executor:download("remote-path", "local-path")
-      local scp_command = "scp -r remote-host:remote-path local-path"
+      local scp_command = "scp -q -r remote-host:remote-path local-path"
       assert.stub(executor_run_job_stub).was.called_with(executor, scp_command, {})
     end)
 
     it("for specified port SCP", function()
       other_executor:download("remote-path", "local-path")
-      local other_scp_command = "scp -P 2310 -r remote-host:remote-path local-path"
+      local other_scp_command = "scp -q -P 2310 -r remote-host:remote-path local-path"
       assert.stub(other_executor_run_job_stub).was.called_with(other_executor, other_scp_command, {})
     end)
   end)
@@ -167,6 +167,32 @@ describe("SSH Executor", function()
     it("when prompt match contains special characters", function()
       executor:process_stdout({ "continue connecting (yes/no/[fingerprint])?" })
       assert.stub(pp).was.called_with(executor, prompts[2])
+    end)
+
+    it("does not rescan transfer history when new output arrives", function()
+      local slice = stub(vim, "list_slice")
+      for _ = 1, 200 do
+        executor:process_stdout({ string.rep("transfer progress ", 100) })
+      end
+      executor:process_stdout({ "pass" })
+      executor:process_stdout({ "word:" })
+      assert.stub(pp).was.called(1)
+      assert.stub(pp).was.called_with(executor, prompts[1])
+      assert.stub(slice).was_not.called()
+      slice:revert()
+    end)
+
+    it("does not match an already handled prompt again", function()
+      executor:process_stdout({ "password:" })
+      executor:process_stdout({ "copying file" })
+      assert.stub(pp).was.called(1)
+    end)
+
+    it("discards partial prompts when starting a new job", function()
+      executor:process_stdout({ "pass" })
+      executor:reset()
+      executor:process_stdout({ "word:" })
+      assert.stub(pp).was_not.called()
     end)
   end)
 

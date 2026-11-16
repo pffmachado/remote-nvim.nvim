@@ -271,6 +271,13 @@ function M.run_cmd(cmd, args, cb)
   return job
 end
 
+---Quote a string as a PowerShell single-quoted literal
+---@param str string
+---@return string
+function M.ps_quote(str)
+  return "'" .. str:gsub("'", "''") .. "'"
+end
+
 function M.get_release_arch_name(arch)
   arch = arch:lower()
 
